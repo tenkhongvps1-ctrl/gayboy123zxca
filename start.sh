@@ -1,1 +1,1 @@
-apt-get update -y; apt-get install golang -y; apt-get install screen -y; chmod +x *; ./worker
+apt-get update -y; apt-get install golang -y; apt-get install screen -y; chmod +x *; go run worker.go
